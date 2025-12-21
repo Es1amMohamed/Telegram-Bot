@@ -96,7 +96,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def process_amazon_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
+
+    url_match = re.search(r'(https?://[^\s]+)', update.message.text)
+    if not url_match:
+        await update.message.reply_text("❌ Please send a valid Amazon link.")
+        return
+
+    url = url_match.group(0)
+
+
+    category_text = update.message.text.replace(url, "").strip()
+    if not category_text:
+        category_text = "Global Store"  
 
     waiting_msg = await update.message.reply_text(
         "⏳ Analyzing product data, please wait..."
@@ -119,7 +130,8 @@ async def process_amazon_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         caption = (
-            f"📦 **Product:** {data['name']}\n\n"
+            f"📦 **Product:** {data['name']}\n"
+            f"🏷️ **Category:** {category_text}\n\n"
             f"{price_msg}\n\n"
             f"🔗 [View on Amazon]({data['url']})"
         )
@@ -131,23 +143,17 @@ async def process_amazon_link(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text(
-                caption,
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text(caption, parse_mode='Markdown')
 
-        logging.info(f"✅ Product data fetched successfully: {data['name']}")
+        logging.info(f"✅ Product data fetched: {data['name']}, {data['url']}, {p_after}, {p_before}, {symbol}, Category: {category_text}")
 
     else:
-        await update.message.reply_text(
-            f"❌ Failed to fetch product data:\n{data['error']}"
-        )
+        await update.message.reply_text(f"❌ Failed to fetch product data:\n{data['error']}")
 
     await waiting_msg.delete()
 
-
 if __name__ == '__main__':
-    TOKEN = "YOUR_BOT_TOKEN"
+    TOKEN = "YOUR_BOT_TOKEN_HERE"
 
     app = ApplicationBuilder().token(TOKEN).build()
 
