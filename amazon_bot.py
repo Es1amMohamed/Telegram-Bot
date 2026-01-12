@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import locale
+import aiohttp
 from playwright.async_api import async_playwright
 from langdetect import detect
 from deep_translator import GoogleTranslator
@@ -123,6 +124,18 @@ MESSAGES = {
         "unavailable_extra": "Das Produkt ist derzeit nicht in den Amazon-Lagern in {country} verfügbar."
     }
 }
+
+async def expand_url(url):
+    if "amazon." in url.lower() and ("/dp/" in url.lower() or "/gp/" in url.lower()):
+        return url
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, allow_redirects=True, timeout=15) as response:
+                return str(response.url)
+    except Exception as e:
+        logging.error(f"Expand Error: {e}")
+        return url
 
 async def parse_egypt(page):
 
@@ -394,7 +407,26 @@ async def parse_general(page):
 
 async def scrape_product(url, country):
     product_country_info = COUNTRIES_CONFIG.get(country, COUNTRIES_CONFIG["United States"])
-    locale_code = product_country_info.get("locale", "en-US")
+    domain = product_country_info.get('domain', 'amazon.com')
+
+    # ─── تحديد الإعدادات حسب الدولة بشكل صارم ───
+    if country == "United States":
+        locale_code = "en-US"
+        accept_lang = "en-US,en;q=0.9"
+    elif country == "Germany":
+        locale_code = "de-DE"
+        accept_lang = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+    elif country == "France":
+        locale_code = "fr-FR"
+        accept_lang = "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
+    elif country == "Italy":
+        locale_code = "it-IT"
+        accept_lang = "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7"
+    else:
+        # الدول العربية والباقي نتركهم زي ما هم
+        locale_code = product_country_info.get("locale", "en-US")
+        accept_lang = f"{product_country_info.get('lang', 'en')},en;q=0.9"
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -404,9 +436,10 @@ async def scrape_product(url, country):
         )
 
         await context.set_extra_http_headers({
-            "Accept-Language": f"{product_country_info.get('lang', 'en')},en;q=0.9",
-            "Referer": f"https://{product_country_info.get('domain', 'amazon.com')}/"
-
+            "Accept-Language": accept_lang,
+            "Referer": f"https://www.{domain}/",
+            # إضافة اختيارية: بتساعد أحيانًا في تثبيت السلوك
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         })
         page = await context.new_page()
         try:
@@ -476,7 +509,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = get_ui_text(context)
-    text = update.message.text.strip()
+    text = update.message.text.strip() if update.message.text else ""
 
     if text == txt["home"]:
         await start(update, context)
@@ -484,30 +517,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton(f"{v['flag']} {k}", callback_data=f"c_{k}")] for k, v in COUNTRIES_CONFIG.items()]
         await update.message.reply_text(txt["btn_country"], reply_markup=InlineKeyboardMarkup(kb))
     elif text == txt["btn_lang"]:
-        lang_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اللغة الأصلية للدولة 🌐", callback_data="lang_local")],
-            [InlineKeyboardButton("English 🇬🇧", callback_data="lang_en")]
-        ])
+        lang_kb = InlineKeyboardMarkup([[InlineKeyboardButton("اللغة الأصلية للدولة 🌐", callback_data="lang_local")], [InlineKeyboardButton("English 🇬🇧", callback_data="lang_en")]])
         await update.message.reply_text("اختر لغة العرض / Choose Display Language:", reply_markup=lang_kb)
     elif text == txt["btn_help"]:
         await update.message.reply_text(txt["help"])
-    elif "amazon." in text.lower() or "amzn.to" in text.lower():
+    
+    elif "http" in text.lower():
         await handle_amazon(update, context)
 
 async def handle_amazon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = get_ui_text(context)
     target_lang = get_target_lang(context)
-    country = context.user_data.get("country", "United States")
-    config = COUNTRIES_CONFIG[country]
+    raw_url = update.message.text.strip()
     
+    final_url = await expand_url(raw_url)
+    
+    if "amazon." not in final_url.lower():
+        return 
+
     status = await update.message.reply_text(txt["fetching"])
-    data = await scrape_product(update.message.text, country)
+
+    current_country = context.user_data.get("country", "United States")
+    for c_name, c_info in COUNTRIES_CONFIG.items():
+        if c_info["domain"] in final_url.lower():
+            current_country = c_name
+            context.user_data["country"] = c_name
+            break
+    
+    config = COUNTRIES_CONFIG[current_country]
+    data = await scrape_product(final_url, current_country)
 
     if not data or not data.get("title"):
         await status.edit_text(txt["error"])
         return
 
-    local_country_name = config["names"].get(target_lang, country)
+    local_country_name = config["names"].get(target_lang, current_country)
     title = translate_text(data["title"], target_lang)
     
     caption = f"📦 <b>{title}</b>\n\n"
@@ -517,7 +561,6 @@ async def handle_amazon(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption += f"💰 <b>{txt['price']}:</b> {data['currentPrice']}\n"
         if data.get("oldPrice"): caption += f"<s>{txt['old_price']}: {data['oldPrice']}</s>\n"
         if data.get("discount"): caption += f"📉 <b>{txt['discount']}:</b> {data['discount']}\n"
-
     caption += f"\n📍 {config['flag']} {local_country_name}"
 
     if data.get("img"):
@@ -531,14 +574,9 @@ async def handle_amazon(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    if query.data.startswith("c_"):
-        context.user_data["country"] = query.data.replace("c_", "")
-    elif query.data == "lang_local":
-        context.user_data["display_lang"] = "local"
-    elif query.data == "lang_en":
-        context.user_data["display_lang"] = "en"
-
+    if query.data.startswith("c_"): context.user_data["country"] = query.data.replace("c_", "")
+    elif query.data == "lang_local": context.user_data["display_lang"] = "local"
+    elif query.data == "lang_en": context.user_data["display_lang"] = "en"
     txt = get_ui_text(context)
     await query.edit_message_text(txt["updated"])
     await query.message.reply_text(txt["welcome"], reply_markup=main_keyboard(context))
